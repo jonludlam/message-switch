@@ -21,6 +21,7 @@ open Async.Std
 
 open Protocol
 open Protocol_async
+open Result
 
 let path = ref "/var/run/message-switch/sock"
 let name = ref "server"
@@ -29,8 +30,8 @@ let timeout = ref None
 let shutdown = "shutdown"
 
 let (>>|=) m f = m >>= function
-  | `Ok x -> f x
-  | `Error y ->
+  | Ok x -> f x
+  | Error y ->
     let b = Buffer.create 16 in
     let fmt = Format.formatter_of_buffer b in
     Client.pp_error fmt y;

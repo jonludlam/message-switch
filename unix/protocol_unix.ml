@@ -16,7 +16,7 @@
 open Message_switch
 open Protocol
 open Cohttp
-
+open Result
 
 let with_lock m f =
   Mutex.lock m;
@@ -180,8 +180,8 @@ module Opt = struct
 end
 
 let (>>|=) m f = match m with
-  | `Error e -> `Error e
-  | `Ok x -> f x
+  | Error e -> Error e
+  | Ok x -> f x
 
 module Client = struct
 
@@ -195,11 +195,11 @@ module Client = struct
   ]
 
   let (>>|=) m f = match m with
-    | `Ok x -> f x
-    | `Error (`Message_switch `Failed_to_read_response) -> `Error (`Message_switch `Failed_to_read_response)
-    | `Error (`Message_switch `Unsuccessful_response) -> `Error (`Message_switch `Unsuccessful_response)
-    | `Error (`Message_switch `Timeout) -> `Error (`Message_switch `Timeout)
-    | `Error (`Message_switch (`Queue_deleted name)) -> `Error (`Message_switch (`Queue_deleted name))
+    | Ok x -> f x
+    | Error (`Message_switch `Failed_to_read_response) -> Error (`Message_switch `Failed_to_read_response)
+    | Error (`Message_switch `Unsuccessful_response) -> Error (`Message_switch `Unsuccessful_response)
+    | Error (`Message_switch `Timeout) -> Error (`Message_switch `Timeout)
+    | Error (`Message_switch (`Queue_deleted name)) -> Error (`Message_switch (`Queue_deleted name))
 
   type 'a result = ('a, [ `Message_switch of error]) Result.result
 
@@ -215,13 +215,13 @@ module Client = struct
       Format.fprintf fmt "The queue %s has been deleted" name
 
   let error_to_msg = function
-    | `Ok x -> `Ok x
-    | `Error y ->
+    | Ok x -> Ok x
+    | Error y ->
       let b = Buffer.create 16 in
       let fmt = Format.formatter_of_buffer b in
       pp_error fmt y;
       Format.pp_print_flush fmt ();
-      `Error (`Msg (Buffer.contents b))
+      Error (`Msg (Buffer.contents b))
 
   type t = {
     mutable requests_conn: (IO.ic * IO.oc);
@@ -244,7 +244,7 @@ module Client = struct
       let events_conn = IO.connect switch in
       Connection.rpc events_conn (In.Login token)
       >>|= fun (_: string) ->
-      `Ok (requests_conn, events_conn) in
+      Ok (requests_conn, events_conn) in
 
     reconnect ()
     >>|= fun (requests_conn, events_conn) ->
@@ -266,15 +266,15 @@ module Client = struct
           let frame = In.Transfer transfer in
           Connection.rpc t.events_conn frame
           >>|= fun raw ->
-          (try `Ok (Out.transfer_of_rpc (Jsonrpc.of_string raw))
-           with e -> `Error (`Message_switch `Failed_to_read_response))
+          (try Ok (Out.transfer_of_rpc (Jsonrpc.of_string raw))
+           with e -> Error (`Message_switch `Failed_to_read_response))
           >>|= fun transfer ->
           match transfer.Out.messages with
-          | [] -> `Ok from
+          | [] -> Ok from
           | m :: ms ->
             begin match List.fold_left (fun acc (i, m) -> match acc, i, m with
-              | `Error e, _, _ -> `Error e
-              | `Ok (), i, m ->
+              | Error e, _, _ -> Error e
+              | Ok (), i, m ->
                  (* If the Ack doesn't belong to us then assume it's another thread *)
                  IO.Mutex.with_lock requests_m (fun () ->
                      match m.Message.kind with
@@ -282,29 +282,29 @@ module Client = struct
                        if Hashtbl.mem wakener j then begin
                          Connection.rpc t.events_conn (In.Ack i)
                          >>|= fun (_: string) ->
-                         IO.Ivar.fill (Hashtbl.find wakener j) (`Ok m);
-                         `Ok ()
+                         IO.Ivar.fill (Hashtbl.find wakener j) (Ok m);
+                         Ok ()
                        end else begin
                          Printf.printf "no wakener for id %s,%Ld\n%!" (fst i) (snd i);
-                         `Ok ()
+                         Ok ()
                        end
-                     | Message.Request _ -> `Ok ()
+                     | Message.Request _ -> Ok ()
                    )
-              ) (`Ok ()) transfer.Out.messages with
-              | `Ok () -> `Ok (Some transfer.Out.next)
-              | `Error _ -> `Ok from (* repeat *)
+              ) (Ok ()) transfer.Out.messages with
+              | Ok () -> Ok (Some transfer.Out.next)
+              | Error _ -> Ok from (* repeat *)
               end
         ) with
-        | `Ok from ->
+        | Ok from ->
           loop from
-        | `Error _ ->
+        | Error _ ->
           reconnect ()
           >>|= fun (requests_conn, events_conn) ->
           t.requests_conn <- requests_conn;
           t.events_conn <- events_conn;
           loop from in
       Thread.create loop None in
-    `Ok t
+    Ok t
 
   (* Maintain at most one connection per process *)
   let connect =
@@ -313,18 +313,18 @@ module Client = struct
     fun ~switch () ->
       IO.Mutex.with_lock m (fun () ->
           match !c with
-          | Some x -> `Ok x
+          | Some x -> Ok x
           | None ->
             connect switch
             >>|= fun c' ->
             c := Some c';
-            `Ok c'
+            Ok c'
         )
 
   let rpc ~t:c ~queue:dest_queue_name ?timeout ~body:x () =
     let t = IO.Ivar.create () in
     let timer = Opt.map (fun timeout ->
-        IO.Clock.run_after timeout (fun () -> IO.Ivar.fill t (`Error (`Message_switch `Timeout)))
+        IO.Clock.run_after timeout (fun () -> IO.Ivar.fill t (Error (`Message_switch `Timeout)))
       ) timeout in
 
     let rec loop () =
@@ -340,34 +340,34 @@ module Client = struct
              >>|= fun (id: string) ->
              match message_id_opt_of_rpc (Jsonrpc.of_string id) with
              | None ->
-               `Error (`Message_switch (`Queue_deleted dest_queue_name))
+               Error (`Message_switch (`Queue_deleted dest_queue_name))
              | Some mid ->
                Hashtbl.add c.wakener mid t;
-               `Ok mid
+               Ok mid
           )
       with
-      | `Ok x -> `Ok x
-      | `Error (`Message_switch (`Queue_deleted _)) as e -> e
-      | `Error _ ->
+      | Ok x -> Ok x
+      | Error (`Message_switch (`Queue_deleted _)) as e -> e
+      | Error _ ->
         Thread.delay 5.;
         loop () in
     loop ()
     >>|= fun id ->
     (* now block waiting for our response *)
     match IO.Ivar.read t with
-    | `Ok response ->
+    | Ok response ->
       (* release resources *)
       Opt.iter IO.Clock.cancel timer;
       IO.Mutex.with_lock c.requests_m (fun () -> Hashtbl.remove c.wakener id);
-      `Ok response.Message.payload
-    | `Error e -> `Error e
+      Ok response.Message.payload
+    | Error e -> Error e
 
   let list ~t:c ~prefix ?(filter=`All) () =
     IO.Mutex.with_lock c.requests_m
       (fun () ->
          Connection.rpc c.requests_conn (In.List(prefix, filter))
          >>|= fun result ->
-         `Ok (Out.string_list_of_rpc (Jsonrpc.of_string result))
+         Ok (Out.string_list_of_rpc (Jsonrpc.of_string result))
       )
 
   let ack ~t:c ~message:(name, id) () =
@@ -375,7 +375,7 @@ module Client = struct
       (fun () ->
          Connection.rpc c.requests_conn (In.Ack(name, id))
          >>|= fun (_: string) ->
-         `Ok ()
+         Ok ()
       )
 
   let diagnostics ~t:c () =
@@ -383,7 +383,7 @@ module Client = struct
       (fun () ->
          Connection.rpc c.requests_conn In.Diagnostics
          >>|= fun (result: string) ->
-         `Ok (Diagnostics.t_of_rpc (Jsonrpc.of_string result))
+         Ok (Diagnostics.t_of_rpc (Jsonrpc.of_string result))
       )
 
   let trace ~t:c ?(from=0L) ?(timeout=0.) () =
@@ -391,7 +391,7 @@ module Client = struct
       (fun () ->
          Connection.rpc c.requests_conn (In.Trace(from, timeout))
          >>|= fun (result: string) ->
-         `Ok (Out.trace_of_rpc (Jsonrpc.of_string result))
+         Ok (Out.trace_of_rpc (Jsonrpc.of_string result))
       )
 
   let shutdown ~t:c () =
@@ -399,7 +399,7 @@ module Client = struct
       (fun () ->
         Connection.rpc c.requests_conn In.Shutdown
         >>|= fun (_: string) ->
-        IO.IO.return (`Ok ())
+        IO.IO.return (Ok ())
       )
 
   let destroy ~t ~queue:queue_name () =
@@ -407,7 +407,7 @@ module Client = struct
       (fun () ->
         Connection.rpc t.requests_conn (In.Destroy queue_name)
         >>|= fun (_: string) ->
-        IO.IO.return (`Ok ())
+        IO.IO.return (Ok ())
       )
 end
 
@@ -429,13 +429,13 @@ module Server = struct
       Format.pp_print_string fmt "Received an unexpected failure from the message-switch"
 
   let error_to_msg = function
-    | `Ok x -> `Ok x
-    | `Error y ->
+    | Ok x -> Ok x
+    | Error y ->
       let b = Buffer.create 16 in
       let fmt = Format.formatter_of_buffer b in
       pp_error fmt y;
       Format.pp_print_flush fmt ();
-      `Error (`Msg (Buffer.contents b))
+      Error (`Msg (Buffer.contents b))
 
   type t = unit
 
@@ -451,7 +451,7 @@ module Server = struct
       >>|= fun (_: string) ->
       Connection.rpc request_conn (In.Login token)
       >>|= fun (_: string) ->
-      `Ok (request_conn, reply_conn) in
+      Ok (request_conn, reply_conn) in
 
     reconnect ()
     >>|= fun ((request_conn, reply_conn) as connections) ->
@@ -469,11 +469,11 @@ module Server = struct
       } in
       let frame = In.Transfer transfer in
       Connection.rpc request_conn frame >>= function
-      | `Error e ->
+      | Error e ->
         IO.Mutex.with_lock mutex reconnect
         >>|= fun connections ->
         loop connections from
-      | `Ok raw ->
+      | Ok raw ->
         let transfer = Out.transfer_of_rpc (Jsonrpc.of_string raw) in
         begin match transfer.Out.messages with
           | [] -> loop connections from
@@ -506,7 +506,7 @@ module Server = struct
             loop connections (Some transfer.Out.next)
         end in
     let (_: Thread.t) = Thread.create (loop connections) None in
-    `Ok ()
+    Ok ()
 
   let shutdown ~t () =
     failwith "Shutdown is unimplemented"
